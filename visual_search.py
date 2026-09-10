@@ -1,9 +1,6 @@
 import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-# Set HF Cache to local directory to avoid cross-platform deployment issues
-os.environ["HF_HOME"] = "./.hf_cache"
-
-import pandas as pd
+import io
+import requests
 import numpy as np
 from PIL import Image
 import torch
@@ -11,6 +8,10 @@ from transformers import CLIPProcessor, CLIPVisionModelWithProjection
 import faiss
 import pickle
 from typing import List, Tuple, Union
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ["HF_HOME"] = "./.hf_cache"
+
 class VisualSearchEngine:
     def __init__(self, model_name: str = "openai/clip-vit-base-patch32", index_file: str = "visual_search_index.faiss", mapping_file: str = "image_mapping.pkl"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,8 +22,8 @@ class VisualSearchEngine:
         self.model = None
         self.processor = None
         self.index = None
-        self.image_paths = []
-        self.embedding_dim = 512 # Default for clip-vit-base-patch32
+        self.image_paths = [] # Holds listing_ids or paths
+        self.embedding_dim = 512
 
     def load_model(self):
         if self.model is None:
@@ -31,7 +32,7 @@ class VisualSearchEngine:
             self.embedding_dim = self.model.config.projection_dim
 
     def load_index(self) -> bool:
-        """Returns True if index was successfully loaded, False otherwise."""
+        """Loads FAISS index and listing ID mapping."""
         if os.path.exists(self.index_file) and os.path.exists(self.mapping_file):
             self.index = faiss.read_index(self.index_file)
             with open(self.mapping_file, 'rb') as f:
@@ -42,12 +43,21 @@ class VisualSearchEngine:
             self.image_paths = []
             return False
 
-    def get_image_embedding(self, image: Union[str, Image.Image]) -> np.ndarray:
+    def get_image_embedding(self, image: Union[str, Image.Image, bytes, io.BytesIO]) -> np.ndarray:
+        """Computes CLIP embedding directly from PIL Image, File Path, Bytes, or In-Memory Stream."""
         self.load_model()
-        if isinstance(image, str):
+        if isinstance(image, bytes):
+            image = Image.open(io.BytesIO(image))
+        elif isinstance(image, io.BytesIO):
             image = Image.open(image)
+        elif isinstance(image, str):
+            if image.startswith(('http://', 'https://')):
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                resp = requests.get(image, headers=headers, timeout=10)
+                image = Image.open(io.BytesIO(resp.content))
+            else:
+                image = Image.open(image)
             
-        # Ensure image is in RGB format for the model to prevent crashes with RGBA (PNG) images
         if image.mode != "RGB":
             image = image.convert("RGB")
             
@@ -59,59 +69,8 @@ class VisualSearchEngine:
         features = features / features.norm(p=2, dim=-1, keepdim=True)
         return features.cpu().numpy()
 
-    def build_index_from_directory(self, image_dir: str, batch_size: int = 32):
-        self.load_model()
-        self.load_index()
-        
-        print(f"Scanning directory {image_dir} for images...")
-        all_image_files = []
-        for root, _, files in os.walk(image_dir):
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    all_image_files.append(os.path.join(root, file))
-                    
-        print(f"Found {len(all_image_files)} images. Generating embeddings...")
-        
-        new_embeddings = []
-        new_paths = []
-        
-        for i in range(0, len(all_image_files), batch_size):
-            batch_paths = all_image_files[i:i+batch_size]
-            batch_images = []
-            valid_paths = []
-            
-            for path in batch_paths:
-                try:
-                    img = Image.open(path).convert("RGB")
-                    batch_images.append(img)
-                    valid_paths.append(path)
-                except Exception as e:
-                    pass
-            
-            if not batch_images: continue
-                
-            inputs = self.processor(images=batch_images, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                features = outputs.image_embeds
-                features = features / features.norm(p=2, dim=-1, keepdim=True)
-                
-            new_embeddings.append(features.cpu().numpy())
-            new_paths.extend(valid_paths)
-            
-            print(f"Processed {min(i+batch_size, len(all_image_files))}/{len(all_image_files)} images")
-
-        if new_embeddings:
-            embeddings_matrix = np.vstack(new_embeddings)
-            self.index.add(embeddings_matrix)
-            self.image_paths.extend(new_paths)
-            
-            faiss.write_index(self.index, self.index_file)
-            with open(self.mapping_file, 'wb') as f:
-                pickle.dump(self.image_paths, f)
-            print(f"Successfully added {len(new_paths)} images to the index.")
-
-    def search_similar_images(self, query_image: Union[str, Image.Image], top_k: int = 5) -> List[Tuple[str, float]]:
+    def search_similar_images(self, query_image: Union[str, Image.Image], top_k: int = 10) -> List[Tuple[str, float]]:
+        """Searches FAISS for top-k similar images and returns list of (listing_id/path, distance)."""
         if self.index is None or self.index.ntotal == 0:
             return []
             
@@ -124,8 +83,3 @@ class VisualSearchEngine:
                 results.append((self.image_paths[idx], float(dist)))
                 
         return results
-
-if __name__ == "__main__":
-    # Run this to build the index!
-    engine = VisualSearchEngine()
-    engine.build_index_from_directory("products")

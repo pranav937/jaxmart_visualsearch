@@ -51,37 +51,30 @@ def load_dataset():
             c.name as "Category",
             c.name as "Subcategory",
             bp."businessName" as "Company Name",
+            addr.city as "Location",
             pd."pricePerUnit" as "Price",
             pd."minOrderQty" as "MOQ",
             l."avgRating" as "Rating",
-            l."reviewCount" as "Reviews"
+            l."reviewCount" as "Reviews",
+            lm.url as "Image URL"
         FROM listings l
         LEFT JOIN categories c ON l."categoryId" = c.id
         LEFT JOIN product_details pd ON l.id = pd."listingId"
         LEFT JOIN business_profiles bp ON l."sellerId" = bp."userId"
+        LEFT JOIN (
+            SELECT DISTINCT ON ("userId") "userId", city 
+            FROM addresses 
+            ORDER BY "userId", "isPrimary" DESC
+        ) addr ON l."sellerId" = addr."userId"
+        LEFT JOIN (
+            SELECT DISTINCT ON ("listingId") "listingId", url 
+            FROM listing_media 
+            ORDER BY "listingId", "isPrimary" DESC, "sortOrder" ASC
+        ) lm ON l.id = lm."listingId"
         '''
         df = pd.read_sql(query, engine)
-        
-        local_image_paths = []
-        base_product_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "products")
-        for listing_id in df['listing_id']:
-            img_path = None
-            if pd.notna(listing_id):
-                listing_dir = os.path.join(base_product_dir, str(listing_id))
-                if os.path.exists(listing_dir):
-                    for ext in ['png', 'jpg', 'jpeg', 'webp']:
-                        candidate = os.path.join(listing_dir, f"1.{ext}")
-                        if os.path.exists(candidate):
-                            # Ensure we store relative path as in original FAISS index
-                            img_path = os.path.join("products", str(listing_id), f"1.{ext}")
-                            break
-            local_image_paths.append(img_path)
-            
-        df['Local Image Path'] = local_image_paths
-        
         if 'Product Name' in df.columns:
             df = df.dropna(subset=['Product Name'])
-        df = df.astype(str)
         return df
 
     except Exception as e:
@@ -109,6 +102,74 @@ def load_visual_search_engine():
 
 vs_engine = load_visual_search_engine()
 
+# Silent Automatic Background Sync (No manual clicks needed)
+@st.cache_resource
+def start_background_auto_sync():
+    import threading
+    def auto_sync_worker():
+        import time
+        from auto_sync import incremental_sync
+        while True:
+            try:
+                incremental_sync()
+            except Exception:
+                pass
+            time.sleep(180) # Check every 3 minutes silently
+    
+    t = threading.Thread(target=auto_sync_worker, daemon=True)
+    t.start()
+    return True
+
+start_background_auto_sync()
+
+def extract_listing_id(path_str):
+    if not path_str:
+        return None
+    parts = os.path.normpath(str(path_str)).replace('/', '\\').split('\\')
+    for part in reversed(parts):
+        if len(part) == 36 and part.count('-') == 4:
+            return part
+    if len(parts) >= 2:
+        return parts[-2]
+    return None
+
+def render_product_card(row):
+    with st.container(border=True):
+        img_url = row.get('Image URL', None)
+        
+        if pd.notna(img_url) and str(img_url).strip() and str(img_url).lower() not in ['none', 'nan', 'n/a']:
+            try:
+                st.image(str(img_url), use_container_width=True)
+            except Exception:
+                pass
+        
+        p_name = row.get('Product Name', 'Unknown')
+        if pd.isna(p_name):
+            p_name = 'Unknown Product'
+        p_name = str(p_name)
+        if len(p_name) > 40:
+            p_name = p_name[:37] + "..."
+            
+        st.markdown(f"<h4 style='color: #FF4B2B; margin-bottom: 5px; min-height: 45px;'>{p_name}</h4>", unsafe_allow_html=True)
+        
+        price_val = row.get('Price', 'N/A')
+        price_str = f"₹{price_val}" if pd.notna(price_val) and str(price_val) not in ['nan', 'None', 'N/A'] else "Contact for Price"
+        st.markdown(f"**💰 Price:** <span style='color: #4CAF50; font-weight: bold;'>{price_str}</span>", unsafe_allow_html=True)
+        
+        comp_name = row.get('Company Name', 'N/A')
+        st.markdown(f"**🏢 Company:** {comp_name if pd.notna(comp_name) and str(comp_name) != 'None' else 'N/A'}")
+        
+        loc_val = row.get('Location', 'N/A')
+        st.markdown(f"**📍 Location:** {loc_val if pd.notna(loc_val) and str(loc_val) != 'None' else 'N/A'}")
+        
+        moq_val = row.get('MOQ', 'N/A')
+        st.markdown(f"**📦 MOQ:** {moq_val if pd.notna(moq_val) and str(moq_val) != 'None' else 'N/A'}")
+        
+        rating_val = row.get('Rating', '0')
+        rev_val = row.get('Reviews', '0')
+        st.markdown(f"**⭐ Rating:** {rating_val if pd.notna(rating_val) else '0'} ({rev_val if pd.notna(rev_val) else '0'} reviews)")
+        st.markdown("<br>", unsafe_allow_html=True)
+
 uploaded_image = st.file_uploader("Upload a product image", type=['jpg', 'jpeg', 'png'])
 
 if uploaded_image is not None and vs_engine is not None:
@@ -118,71 +179,56 @@ if uploaded_image is not None and vs_engine is not None:
     with st.spinner("Analyzing image and searching visually similar products..."):
         try:
             img = PILImage.open(uploaded_image)
-            # Find the best match to identify the product's subcategory
-            best_match_results = vs_engine.search_similar_images(img, top_k=5)
+            best_match_results = vs_engine.search_similar_images(img, top_k=10)
             
             if best_match_results:
+                matched_rows_list = []
                 matched_subcategory = None
                 
-                # Find the subcategory of the closest matched product
+                # Retrieve direct matching product rows from df_global
                 for img_path, score in best_match_results:
-                    norm_path = os.path.normpath(str(img_path)).lower()
-                    if not df_global.empty and 'Local Image Path' in df_global.columns:
-                        # Normalize column paths for safe comparison
-                        matched_rows = df_global[df_global['Local Image Path'].apply(lambda x: os.path.normpath(str(x)).lower() if pd.notna(x) else '') == norm_path]
-                        if not matched_rows.empty:
-                            p_row = matched_rows.iloc[0]
-                            matched_subcategory = p_row.get('Subcategory', None)
-                            
-                            # If subcategory is missing or nan, fallback to Category
-                            if pd.isna(matched_subcategory) or str(matched_subcategory).strip() == '' or str(matched_subcategory).lower() == 'nan':
-                                matched_subcategory = p_row.get('Category', None)
-                            if matched_subcategory:
-                                break
+                    lid = extract_listing_id(img_path)
+                    if lid and not df_global.empty:
+                        matched_df = df_global[df_global['listing_id'] == lid]
+                        if not matched_df.empty:
+                            p_row = matched_df.iloc[0]
+                            matched_rows_list.append((p_row, score))
+                            if not matched_subcategory:
+                                sub = p_row.get('Subcategory', None)
+                                if pd.isna(sub) or str(sub).strip() in ['', 'nan', 'None']:
+                                    sub = p_row.get('Category', None)
+                                if pd.notna(sub) and str(sub).strip() not in ['', 'nan', 'None']:
+                                    matched_subcategory = str(sub).strip()
                 
-                if matched_subcategory and str(matched_subcategory).lower() != 'nan':
-                    st.success(f"**Identified Category/Subcategory:** {matched_subcategory}")
-                    st.markdown(f"### 📷 All Products in '{matched_subcategory}':")
-                    
-                    # Filter dataset by this subcategory or category
-                    subcat_df = df_global[(df_global['Subcategory'] == matched_subcategory) | (df_global['Category'] == matched_subcategory)]
-                    
-                    # Remove exact duplicate product names so pictures don't repeat
-                    subcat_df = subcat_df.drop_duplicates(subset=['Product Name'])
-                    
-                    # Limit to 15 products to not overwhelm the UI
-                    display_df = subcat_df.head(15)
+                # 1. Show Top Visually Similar Products
+                if matched_rows_list:
+                    st.success(f"**Found {len(matched_rows_list)} Visually Similar Products!** (Category: {matched_subcategory if matched_subcategory else 'General'})")
+                    st.markdown("### 🎯 Top Visually Similar Products:")
                     
                     cols = st.columns(3)
+                    for i, (p_row, score) in enumerate(matched_rows_list[:6]):
+                        with cols[i % 3]:
+                            render_product_card(p_row)
+                            
+                    st.markdown("---")
+                
+                # 2. Show More Products from the Same Category/Subcategory
+                if matched_subcategory:
+                    st.markdown(f"### 📦 More Products in '{matched_subcategory}':")
+                    subcat_df = df_global[(df_global['Subcategory'] == matched_subcategory) | (df_global['Category'] == matched_subcategory)]
                     
-                    for i, (_, row) in enumerate(display_df.iterrows()):
-                        col_idx = i % 3
-                        with cols[col_idx]:
-                            with st.container(border=True):
-                                local_img = row.get('Local Image Path', '')
-                                if os.path.exists(local_img):
-                                    try:
-                                        img_pil = PILImage.open(local_img).convert('RGB')
-                                        img_pil = img_pil.resize((300, 300))
-                                        st.image(img_pil) 
-                                    except Exception:
-                                        pass
-                                
-                                p_name = row.get('Product Name', 'Unknown')
-                                if len(p_name) > 40:
-                                    p_name = p_name[:37] + "..."
-                                    
-                                st.markdown(f"<h4 style='color: #FF4B2B; margin-bottom: 5px; min-height: 45px;'>{p_name}</h4>", unsafe_allow_html=True)
-                                
-                                # All details displayed directly without hiding
-                                st.markdown(f"**💰 Price:** <span style='color: #4CAF50; font-weight: bold;'>{row.get('Price', 'N/A')}</span>", unsafe_allow_html=True)
-                                st.markdown(f"**🏢 Company:** {row.get('Company Name', 'N/A')}")
-                                st.markdown(f"**📍 Location:** {row.get('Location', 'N/A')}")
-                                st.markdown(f"**📦 MOQ:** {row.get('MOQ', 'N/A')}")
-                                st.markdown(f"**⭐ Rating:** {row.get('Rating', 'N/A')} ({row.get('Reviews', '0')} reviews)")
-                                st.markdown("<br>", unsafe_allow_html=True)
-                else:
-                    st.warning("Could not identify a clear Subcategory for this image in the database.")
+                    # Exclude already shown listing IDs
+                    shown_ids = {r[0]['listing_id'] for r in matched_rows_list[:6]}
+                    subcat_df = subcat_df[~subcat_df['listing_id'].isin(shown_ids)]
+                    subcat_df = subcat_df.drop_duplicates(subset=['Product Name']).head(12)
+                    
+                    if not subcat_df.empty:
+                        cols = st.columns(3)
+                        for i, (_, row) in enumerate(subcat_df.iterrows()):
+                            with cols[i % 3]:
+                                render_product_card(row)
+                elif not matched_rows_list:
+                    st.warning("Could not identify matching products for this image in the database.")
             else:
                 st.warning("Visual Search index is empty. Please wait for the background indexing to finish.")
         except Exception as e:
