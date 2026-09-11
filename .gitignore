@@ -1,5 +1,7 @@
-.hf_cache/
 __pycache__/
+*.pyc
+*.pyo
+.hf_cache/
 products/
-*.faiss
-*.pkl
+.env
+.DS_Store

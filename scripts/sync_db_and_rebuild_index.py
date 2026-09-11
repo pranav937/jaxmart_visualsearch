@@ -11,10 +11,15 @@ from sqlalchemy import create_engine, text
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["HF_HOME"] = "./.hf_cache"
 
+# Ensure parent directory is in sys.path
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 DB_URL = "postgresql://postgres:Jadequest%403009@3.111.57.216:5432/jaxmart_db"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PRODUCTS_DIR = os.path.join(BASE_DIR, "products")
 os.makedirs(PRODUCTS_DIR, exist_ok=True)
+
 
 def fetch_db_listings():
     print("Connecting to PostgreSQL Database...")

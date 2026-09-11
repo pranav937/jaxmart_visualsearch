@@ -16,8 +16,12 @@ os.environ["HF_HOME"] = "./.hf_cache"
 
 DB_URL = "postgresql://postgres:Jadequest%403009@3.111.57.216:5432/jaxmart_db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INDEX_FILE = os.path.join(BASE_DIR, "visual_search_index.faiss")
-MAPPING_FILE = os.path.join(BASE_DIR, "image_mapping.pkl")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+INDEX_FILE = os.path.join(DATA_DIR, "visual_search_index.faiss") if os.path.exists(os.path.join(DATA_DIR, "visual_search_index.faiss")) else os.path.join(BASE_DIR, "visual_search_index.faiss")
+MAPPING_FILE = os.path.join(DATA_DIR, "image_mapping.pkl") if os.path.exists(os.path.join(DATA_DIR, "image_mapping.pkl")) else os.path.join(BASE_DIR, "image_mapping.pkl")
+
 
 def extract_listing_id(path_str):
     if not path_str:
